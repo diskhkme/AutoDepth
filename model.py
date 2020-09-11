@@ -22,7 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
-
+import matplotlib.pyplot as plt
+import torchvision.models as models
 
 def knn(x, k):
     inner = -2*torch.matmul(x.transpose(2, 1), x)
@@ -99,7 +100,7 @@ class DGCNN_cls(nn.Module):
         super(DGCNN_cls, self).__init__()
         self.args = args
         self.k = args.k
-        
+
         self.bn1 = nn.BatchNorm2d(64)
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(128)
@@ -159,9 +160,142 @@ class DGCNN_cls(nn.Module):
         x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2) # (batch_size, 512) -> (batch_size, 256)
         x = self.dp2(x)
         x = self.linear3(x)                                             # (batch_size, 256) -> (batch_size, output_channels)
-        
+
         return x
 
+
+class DGCNN_AutoDepth(nn.Module):
+    def __init__(self, args):
+        super(DGCNN_AutoDepth, self).__init__()
+        self.args = args
+        self.k = args.k
+
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm1d(args.emb_dims)
+
+        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
+                                   self.bn1,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv2 = nn.Sequential(nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
+                                   self.bn2,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv3 = nn.Sequential(nn.Conv2d(64 * 2, 128, kernel_size=1, bias=False),
+                                   self.bn3,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv4 = nn.Sequential(nn.Conv2d(128 * 2, 256, kernel_size=1, bias=False),
+                                   self.bn4,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv5 = nn.Sequential(nn.Conv1d(512, args.emb_dims, kernel_size=1, bias=False),
+                                   self.bn5,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.linear1 = nn.Linear(args.emb_dims * 2, 512, bias=False)
+        self.bn6 = nn.BatchNorm1d(512)
+        self.dp1 = nn.Dropout(p=args.dropout)
+        self.linear2 = nn.Linear(512, 256)
+        self.bn7 = nn.BatchNorm1d(256)
+        self.dp2 = nn.Dropout(p=args.dropout)
+        self.linear3 = nn.Linear(256, 6*args.num_view) # 6D output for camera eye pos & up vector
+
+        net = models.resnet50(pretrained=True)
+        self.net_1 = nn.Sequential(*list(net.children())[:-1])
+        self.net_2 = nn.Linear(2048,args.output_channels)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        sourcePoints = x.clone()
+
+        x = x[:,:,:self.args.num_subpoints_for_view_pred] # view prediction을 위해서는 원본 점군의 subset만 활용
+        x = get_graph_feature(x, k=self.k)  # (batch_size, 3, num_points) -> (batch_size, 3*2, num_points, k)
+        x = self.conv1(x)  # (batch_size, 3*2, num_points, k) -> (batch_size, 64, num_points, k)
+        x1 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
+
+        x = get_graph_feature(x1, k=self.k)  # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
+        x = self.conv2(x)  # (batch_size, 64*2, num_points, k) -> (batch_size, 64, num_points, k)
+        x2 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
+
+        x = get_graph_feature(x2, k=self.k)  # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
+        x = self.conv3(x)  # (batch_size, 64*2, num_points, k) -> (batch_size, 128, num_points, k)
+        x3 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 128, num_points, k) -> (batch_size, 128, num_points)
+
+        x = get_graph_feature(x3, k=self.k)  # (batch_size, 128, num_points) -> (batch_size, 128*2, num_points, k)
+        x = self.conv4(x)  # (batch_size, 128*2, num_points, k) -> (batch_size, 256, num_points, k)
+        x4 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 256, num_points, k) -> (batch_size, 256, num_points)
+
+        x = torch.cat((x1, x2, x3, x4), dim=1)  # (batch_size, 64+64+128+256, num_points)
+
+        x = self.conv5(x)  # (batch_size, 64+64+128+256, num_points) -> (batch_size, emb_dims, num_points)
+        x1 = F.adaptive_max_pool1d(x, 1).view(batch_size,
+                                              -1)  # (batch_size, emb_dims, num_points) -> (batch_size, emb_dims)
+        x2 = F.adaptive_avg_pool1d(x, 1).view(batch_size,
+                                              -1)  # (batch_size, emb_dims, num_points) -> (batch_size, emb_dims)
+        x = torch.cat((x1, x2), 1)  # (batch_size, emb_dims*2)
+
+        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)  # (batch_size, emb_dims*2) -> (batch_size, 512)
+        x = self.dp1(x)
+        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)  # (batch_size, 512) -> (batch_size, 256)
+        x = self.dp2(x)
+        x = self.linear3(x)  # (batch_size, 256) -> (batch_size, output_channels)
+
+        # -----------View Prediction------------------------------------------------------------#
+        # 카메라가 항상 0,0,0을 바라본다고 보장할 수는 없음(이를 유도하는 방향으로 수정할 수도?)
+        xre = x.view(batch_size, self.args.num_view, 6)
+        eye = xre[:,:,0:3] / xre[:,:,0:3].norm(dim=2).view(batch_size,self.args.num_view,1)
+        up =xre[:,:,3:6] / xre[:,:,3:6].norm(dim=2).view(batch_size,self.args.num_view,1)
+        n = torch.cross(eye,up)
+        unitn = n / n.norm(dim=2).view(batch_size,self.args.num_view,1)
+        unitup = torch.cross(unitn,eye) #논문에서는 세 축의 orthogonalize과정은 없음. 이것을 추가하면 더 좋아질까? (원본 논문대로면 그냥 up벡터 사용)
+
+        matC = torch.cat((unitn,unitup,eye),dim=2).view(batch_size,self.args.num_view,3,3) # (batch_size, 3 x 3)
+        # TODO : matmul broadcasting때문에 numview = 2로 고정을 가정하고 구현...
+        # (16x2x3x3) * (16x3x1024) --> (16x2x3x1024)를 원하는데...
+        ViewPredictedPC = torch.stack((torch.bmm(matC[:, 0, :, :], sourcePoints),torch.bmm(matC[:, 0, :, :], sourcePoints)),dim=1)
+        #ViewPredictedPC = torch.matmul(matC,sourcePoints)
+
+        # --------------------------------------------------------------------------------------#
+
+
+        #-------------Depth Image Generation----------------------------------------------------#
+        # Orthograpghic Projection
+        # Segmented Point cloud의 경우 unit sphere 안으로 normalize되었으니 모든 점이 [output, inverse_indices,counts = Index.unique(return_inverse=True,dim=1,return_counts=True)-0.5, 0.5]^3 안에 들어와 있음
+        # x,y축으로는 viewportWidth(Height) 만큼 곱한 뒤 viewportWidth(Height) / 2 만큼 더하면 [0,viewportWidth] 범위로 변환됨
+        # z축으로는 0.5만큼 더하면 [0,1] 범위로 변환됨
+        # (ModelNet의 경우 normalize 안되었으니 다르게 구현해야 함)
+        viewportRes = self.args.projected_img_res
+
+        ViewPredictedPC[:, :, 0, :] = ViewPredictedPC[:, :, 0, :] * viewportRes + viewportRes/2
+        ViewPredictedPC[:, :, 1, :] = ViewPredictedPC[:, :, 1, :] * viewportRes + viewportRes/2
+        ViewPredictedPC[:, :, 2, :] = ViewPredictedPC[:, :, 2, :] + 0.5
+
+        ResultImg = torch.ones([batch_size*self.args.num_view,3,viewportRes,viewportRes], dtype=torch.float32).to(torch.device('cuda'))
+
+        # TODO : for문 때문에 너무 느림!
+        #계산 편의를 위해 indexed representation으로 변환
+        Index = ViewPredictedPC.round()
+        Depth = ViewPredictedPC[:,:,2,:]
+        for i in range(batch_size):
+            for k in range(self.args.num_view):
+                for j in range(Index.shape[3]): # point index
+                    pixX = Index[i,k,0,j].int()
+                    pixY = Index[i,k,1,j].int()
+                    if pixX < 0 or pixX >= viewportRes or pixY < 0 or pixY >= viewportRes:
+                        continue
+
+                    if Depth[i,k,j] < ResultImg[i*self.args.num_view + k,0,pixX,pixY]:
+                        ResultImg[i*self.args.num_view + k, 0 ,pixX, pixY] = Depth[i, k, j]
+                        ResultImg[i*self.args.num_view + k, 1, pixX, pixY] = Depth[i, k, j]
+                        ResultImg[i*self.args.num_view + k, 2, pixX, pixY] = Depth[i, k, j]
+
+        # Debug purpose, show image
+        # plt.imshow(ResultImg[0,:,:].cpu().detach().numpy())
+
+        y = self.net_1(ResultImg)
+        y = y.view((int(ResultImg.shape[0] / self.args.num_view), self.args.num_view, y.shape[-3], y.shape[-2], y.shape[-1]))
+        y = self.net_2(torch.max(y,1)[0].view(y.shape[0],-1))
+
+        return y
 
 class Transform_Net(nn.Module):
     def __init__(self, args):
