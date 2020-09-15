@@ -239,6 +239,7 @@ class DGCNN_AutoDepth(nn.Module):
         x = self.dp2(x)
         x = self.linear3(x)  # (batch_size, 256) -> (batch_size, output_channels)
 
+
         # -----------View Prediction------------------------------------------------------------#
         # 카메라가 항상 0,0,0을 바라본다고 보장할 수는 없음(이를 유도하는 방향으로 수정할 수도?)
         xre = x.view(batch_size, self.args.num_view, 6)
@@ -273,37 +274,73 @@ class DGCNN_AutoDepth(nn.Module):
 
         ViewPredictedPC[:, :, 0, :] = ViewPredictedPC[:, :, 0, :] * viewportRes/2 + viewportRes/2
         ViewPredictedPC[:, :, 1, :] = ViewPredictedPC[:, :, 1, :] * viewportRes/2 + viewportRes/2
-        ViewPredictedPC[:, :, 2, :] = ViewPredictedPC[:, :, 2, :]/2 + 0.5
+        ViewPredictedPC[:, :, 2, :] = ViewPredictedPC[:, :, 2, :]/2 + 0.5 # TODO : Eye position에 따라 depth 가 범위 내에 들어오지 않아 잘리는 경우가 생김. 처리 하는것이 성능 향상될 수 있음
 
-        ResultImg = torch.zeros([batch_size*self.args.num_view,3,viewportRes,viewportRes], dtype=torch.float32).to(torch.device('cuda'))
+        # ResultImg = torch.zeros([batch_size*self.args.num_view,3,viewportRes,viewportRes], dtype=torch.float32).to(torch.device('cuda'))
 
         # TODO : for문 때문에 너무 느림! point index만큼 loop를 도는 것은 어쩔 수 없으나, batch와 num_view 부분을 없애야 함
         #계산 편의를 위해 indexed representation으로 변환
-        Index = ViewPredictedPC.round()
-        Depth = ViewPredictedPC[:,:,2,:] # (batch_size x num_view x 3 x num points)
-        for i in range(batch_size):
-            for k in range(self.args.num_view):
-                # ------ Silluette Rendering (depth 정보 없음)
-                # 확실히 빠름
-                # xIndices = Index[i, k, 0, :].int()
-                # xIndices[xIndices < 0] = 0
-                # xIndices[xIndices > viewportRes-1] = 0
-                # yIndices = Index[i, k, 1, :].int()
-                # yIndices[yIndices < 0] = 0
-                # yIndices[yIndices > viewportRes-1] = 0
-                # ResultImg[i*self.args.num_view + k, :, xIndices.long(), yIndices.long()] = 0
+        Index = ViewPredictedPC.round() # (batch_size x num_view x 3 x num points)
+        Depth = ViewPredictedPC[:,:,2,:]
 
-                # ------ Depth Rendering
-                for j in range(Index.shape[3]): # point index
-                    pixX = Index[i,k,0,j].int()
-                    pixY = Index[i,k,1,j].int()
-                    if pixX < 0 or pixX >= viewportRes or pixY < 0 or pixY >= viewportRes:
-                        continue
+        xCoords = Index[:, :, 0, :].int() # (batch_size x num_view x num_points)
+        yCoords = Index[:, :, 1, :].int() # (batch_size x num_view x num_points)
 
-                    if (1 - Depth[i,k,j]) > ResultImg[i*self.args.num_view + k,0,pixX,pixY]:
-                        ResultImg[i*self.args.num_view + k, 0 ,pixX, pixY] = 1-Depth[i, k, j]
-                        ResultImg[i*self.args.num_view + k, 1, pixX, pixY] = 1-Depth[i, k, j]
-                        ResultImg[i*self.args.num_view + k, 2, pixX, pixY] = 1-Depth[i, k, j]
+        DepthImg = torch.zeros([batch_size , self.args.num_view, viewportRes * viewportRes], dtype=torch.float32).to(
+            torch.device('cuda'))
+
+        for p in range(Index.shape[3]):
+            px = xCoords[:, :, p] # (batch_size x num_view) --> 모든 batch, 2개 view에서 해당 점의 x좌표
+            py = yCoords[:, :, p] # (batch_size x num_view) --> 모든 batch, 2개 view에서 해당 점의 y좌표
+            pDepth = 1 - Depth[:,:,p] # (batch_size x num_view), depth는 1-depth 값을 사용(가까이 있는 점이 높은 pixel value)
+
+            # px, py가 이미지 범위를 벗어난 경우, x,y 픽셀 값을 0으로 바꾸고, depth값도 background값(0)으로 바꿈
+            outBoundIndices = (px < 0) | (px >= viewportRes) | (py < 0) | (py >= viewportRes)
+            px[outBoundIndices] = 0
+            py[outBoundIndices] = 0
+            pDepth[outBoundIndices] = 0
+
+            # TODO : 메모리 사용량을 줄이기 위해 in-place scatter_를 사용하면 좋으나, 이를 위해서는 flattenIndex를 사용하지 않아야 할 것 같음
+            # TODO : 이를 위해서는 gather와 scatter에 px,py를 그대로 사용하는 방안을 생각해 봐야 함 (이때문에 batch size를 32->4까지 줄여야 했음)
+            FlattenIndex = px * viewportRes + py
+
+            # gather를 통해 현재 depth buffer에 쓰여 있는 값을 얻어올 수 있음. 이를 pDepth와 element-wise 비교해 새로 쓰여질 값 텐서를 생성
+            maxVals = torch.max(DepthImg.gather(2, FlattenIndex.unsqueeze(2).long()).squeeze(),1-pDepth)
+            # scatter를 통해 maxVals의 값을 다시 FlattenDepthImg에 Write
+            DepthImg = DepthImg.scatter(2, FlattenIndex.long().unsqueeze(2), maxVals.unsqueeze(2))
+
+        DepthImg = DepthImg.view((batch_size , self.args.num_view, viewportRes , viewportRes))
+
+        # Debug Draw
+        # plt.imshow(DepthImg[1, 0, :, :].cpu().detach().numpy())
+
+        # Result Image dimension 변경 (batch * num_view x 3 x viewportRes x viewportRes) (mvcnn 구조에 입력하기 위함)
+        ResultImg = torch.stack((DepthImg, DepthImg, DepthImg), dim=2)
+        ResultImg = ResultImg.view(-1, ResultImg.shape[2], ResultImg.shape[3], ResultImg.shape[4])
+
+        # for i in range(batch_size):
+        #     for k in range(self.args.num_view):
+        #         # ------ Silluette Rendering (depth 정보 없음)
+        #         # 확실히 빠름
+        #         # xIndices = Index[i, k, 0, :].int()
+        #         # xIndices[xIndices < 0] = 0
+        #         # xIndices[xIndices > viewportRes-1] = 0
+        #         # yIndices = Index[i, k, 1, :].int()
+        #         # yIndices[yIndices < 0] = 0
+        #         # yIndices[yIndices > viewportRes-1] = 0
+        #         # ResultImg[i*self.args.num_view + k, :, xIndices.long(), yIndices.long()] = 0
+        #
+        #         # ------ Depth Rendering
+        #         for j in range(Index.shape[3]): # point index
+        #             pixX = Index[i,k,0,j].int()
+        #             pixY = Index[i,k,1,j].int()
+        #             if pixX < 0 or pixX >= viewportRes or pixY < 0 or pixY >= viewportRes:
+        #                 continue
+        #
+        #             if (1 - Depth[i,k,j]) > ResultImg[i*self.args.num_view + k,0,pixX,pixY]:
+        #                 ResultImg[i*self.args.num_view + k, 0 ,pixX, pixY] = 1-Depth[i, k, j]
+        #                 ResultImg[i*self.args.num_view + k, 1, pixX, pixY] = 1-Depth[i, k, j]
+        #                 ResultImg[i*self.args.num_view + k, 2, pixX, pixY] = 1-Depth[i, k, j]
 
 
 
