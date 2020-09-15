@@ -242,54 +242,73 @@ class DGCNN_AutoDepth(nn.Module):
         # -----------View Prediction------------------------------------------------------------#
         # 카메라가 항상 0,0,0을 바라본다고 보장할 수는 없음(이를 유도하는 방향으로 수정할 수도?)
         xre = x.view(batch_size, self.args.num_view, 6)
-        eye = xre[:,:,0:3] / xre[:,:,0:3].norm(dim=2).view(batch_size,self.args.num_view,1)
+        unitn = xre[:,:,0:3] / xre[:,:,0:3].norm(dim=2).view(batch_size,self.args.num_view,1)
         up =xre[:,:,3:6] / xre[:,:,3:6].norm(dim=2).view(batch_size,self.args.num_view,1)
-        n = torch.cross(eye,up)
-        unitn = n / n.norm(dim=2).view(batch_size,self.args.num_view,1)
-        unitup = torch.cross(unitn,eye) #논문에서는 세 축의 orthogonalize과정은 없음. 이것을 추가하면 더 좋아질까? (원본 논문대로면 그냥 up벡터 사용)
+        u = torch.cross(up,unitn)
+        unitu = u / u.norm(dim=2).view(batch_size,self.args.num_view,1)
+        unitv = torch.cross(unitn,unitu) #논문에서는 세 축의 orthogonalize과정은 없음. 이것을 추가하면 더 좋아질까? (원본 논문대로면 그냥 up벡터 사용)
 
-        matC = torch.cat((unitn,unitup,eye),dim=2).view(batch_size,self.args.num_view,3,3) # (batch_size, 3 x 3)
+        matC = torch.cat((unitu,unitv,unitn),dim=2).view(batch_size,self.args.num_view,3,3) # (batch_size, 3 x 3)
         # TODO : matmul broadcasting때문에 numview = 2로 고정을 가정하고 구현...
         # (16x2x3x3) * (16x3x1024) --> (16x2x3x1024)를 원하는데...
-        ViewPredictedPC = torch.stack((torch.bmm(matC[:, 0, :, :], sourcePoints),torch.bmm(matC[:, 0, :, :], sourcePoints)),dim=1)
-        #ViewPredictedPC = torch.matmul(matC,sourcePoints)
+        # ViewPredictedPC = torch.matmul(matC,sourcePoints)
+        # ViewPredictedPC = torch.stack((torch.bmm(matC[:, 0, :, :], sourcePoints),torch.bmm(matC[:, 1, :, :], sourcePoints)),dim=1)
+        ViewPoints1 = sourcePoints - xre[:,0,0:3].unsqueeze(-1)
+        ViewPoints2 = sourcePoints - xre[:,1,0:3].unsqueeze(-1)
+        ViewPredictedPC = torch.stack(
+            (torch.bmm(matC[:, 0, :, :], ViewPoints1), torch.bmm(matC[:, 1, :, :], ViewPoints2)), dim=1)
+
+
 
         # --------------------------------------------------------------------------------------#
 
 
         #-------------Depth Image Generation----------------------------------------------------#
         # Orthograpghic Projection
-        # Segmented Point cloud의 경우 unit sphere 안으로 normalize되었으니 모든 점이 [output, inverse_indices,counts = Index.unique(return_inverse=True,dim=1,return_counts=True)-0.5, 0.5]^3 안에 들어와 있음
-        # x,y축으로는 viewportWidth(Height) 만큼 곱한 뒤 viewportWidth(Height) / 2 만큼 더하면 [0,viewportWidth] 범위로 변환됨
-        # z축으로는 0.5만큼 더하면 [0,1] 범위로 변환됨
+        # Segmented Point cloud의 경우 unit sphere 안으로 normalize되었으니 모든 점이 [-1, 1]^3 안에 들어와 있음
+        # x,y축으로는 viewportWidth(Height)/2 만큼 곱한 뒤 viewportWidth(Height) / 2 만큼 더하면 [0,viewportWidth] 범위로 변환됨
+        # z축으로는 2로 나눈뒤 0.5만큼 더하면 [0,1] 범위로 변환됨
         # (ModelNet의 경우 normalize 안되었으니 다르게 구현해야 함)
         viewportRes = self.args.projected_img_res
 
-        ViewPredictedPC[:, :, 0, :] = ViewPredictedPC[:, :, 0, :] * viewportRes + viewportRes/2
-        ViewPredictedPC[:, :, 1, :] = ViewPredictedPC[:, :, 1, :] * viewportRes + viewportRes/2
-        ViewPredictedPC[:, :, 2, :] = ViewPredictedPC[:, :, 2, :] + 0.5
+        ViewPredictedPC[:, :, 0, :] = ViewPredictedPC[:, :, 0, :] * viewportRes/2 + viewportRes/2
+        ViewPredictedPC[:, :, 1, :] = ViewPredictedPC[:, :, 1, :] * viewportRes/2 + viewportRes/2
+        ViewPredictedPC[:, :, 2, :] = ViewPredictedPC[:, :, 2, :]/2 + 0.5
 
-        ResultImg = torch.ones([batch_size*self.args.num_view,3,viewportRes,viewportRes], dtype=torch.float32).to(torch.device('cuda'))
+        ResultImg = torch.zeros([batch_size*self.args.num_view,3,viewportRes,viewportRes], dtype=torch.float32).to(torch.device('cuda'))
 
-        # TODO : for문 때문에 너무 느림!
+        # TODO : for문 때문에 너무 느림! point index만큼 loop를 도는 것은 어쩔 수 없으나, batch와 num_view 부분을 없애야 함
         #계산 편의를 위해 indexed representation으로 변환
         Index = ViewPredictedPC.round()
-        Depth = ViewPredictedPC[:,:,2,:]
+        Depth = ViewPredictedPC[:,:,2,:] # (batch_size x num_view x 3 x num points)
         for i in range(batch_size):
             for k in range(self.args.num_view):
+                # ------ Silluette Rendering (depth 정보 없음)
+                # 확실히 빠름
+                # xIndices = Index[i, k, 0, :].int()
+                # xIndices[xIndices < 0] = 0
+                # xIndices[xIndices > viewportRes-1] = 0
+                # yIndices = Index[i, k, 1, :].int()
+                # yIndices[yIndices < 0] = 0
+                # yIndices[yIndices > viewportRes-1] = 0
+                # ResultImg[i*self.args.num_view + k, :, xIndices.long(), yIndices.long()] = 0
+
+                # ------ Depth Rendering
                 for j in range(Index.shape[3]): # point index
                     pixX = Index[i,k,0,j].int()
                     pixY = Index[i,k,1,j].int()
                     if pixX < 0 or pixX >= viewportRes or pixY < 0 or pixY >= viewportRes:
                         continue
 
-                    if Depth[i,k,j] < ResultImg[i*self.args.num_view + k,0,pixX,pixY]:
-                        ResultImg[i*self.args.num_view + k, 0 ,pixX, pixY] = Depth[i, k, j]
-                        ResultImg[i*self.args.num_view + k, 1, pixX, pixY] = Depth[i, k, j]
-                        ResultImg[i*self.args.num_view + k, 2, pixX, pixY] = Depth[i, k, j]
+                    if (1 - Depth[i,k,j]) > ResultImg[i*self.args.num_view + k,0,pixX,pixY]:
+                        ResultImg[i*self.args.num_view + k, 0 ,pixX, pixY] = 1-Depth[i, k, j]
+                        ResultImg[i*self.args.num_view + k, 1, pixX, pixY] = 1-Depth[i, k, j]
+                        ResultImg[i*self.args.num_view + k, 2, pixX, pixY] = 1-Depth[i, k, j]
+
+
 
         # Debug purpose, show image
-        # plt.imshow(ResultImg[0,:,:].cpu().detach().numpy())
+        # plt.imshow(ResultImg[0,:,:].cpu().detach().numpy().transpose(2,1,0))
 
         y = self.net_1(ResultImg)
         y = y.view((int(ResultImg.shape[0] / self.args.num_view), self.args.num_view, y.shape[-3], y.shape[-2], y.shape[-1]))
