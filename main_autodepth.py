@@ -26,6 +26,9 @@ import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
+import torch.autograd.profiler as profiler
+
+from tqdm import tqdm
 
 
 def _init_():
@@ -51,6 +54,7 @@ def train(args, io):
     if args.dataset == 'knu':
         train_loader = DataLoader(KNUSegmentedPointCloud(partition='train', num_points=args.num_points), num_workers=8,
                                   batch_size=args.batch_size, shuffle=True, drop_last=True)
+        train_count = train_loader.dataset.data.shape[0]
         test_loader = DataLoader(KNUSegmentedPointCloud(partition='test', num_points=args.num_points), num_workers=8,
                                  batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
@@ -94,15 +98,27 @@ def train(args, io):
         train_pred = []
         train_true = []
         batch = 0
+        per_epoch_batch = (args.batch_size / train_count)
         for data, label in train_loader:
-            # print(batch)
+            print("processing {0} batch...".format(batch))
             batch = batch+1
             data, label = data.to(device), label.to(device).squeeze()
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
             opt.zero_grad()
+            # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
+            #     with profiler.record_function("train_forward"):
+            #         logits = model(data)
+            # print(prof)
+            # prof.export_chrome_trace("train_forward.json")
             logits = model(data)
             loss = criterion(logits, label)
+
+            # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
+            #     with profiler.record_function("train_backward"):
+            #         loss.backward()
+            # print(prof)
+            # prof.export_chrome_trace("train_backward.json")
             loss.backward()
             opt.step()
             preds = logits.max(dim=1)[1]
