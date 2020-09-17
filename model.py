@@ -283,38 +283,30 @@ class DGCNN_AutoDepth(nn.Module):
         ViewPredictedPC[:, :, 1, :] = ViewPredictedPC[:, :, 1, :] * viewportRes/2 + viewportRes/2
         ViewPredictedPC[:, :, 2, :] = ViewPredictedPC[:, :, 2, :]/2 + 1 # [0~-2] -> [0~-1] -> [1~0]
 
-        Index = ViewPredictedPC.round() # (batch_size x num_view x 3 x num points)
-        Depth = ViewPredictedPC[:,:,2,:]
+        xCoord = torch.clamp(ViewPredictedPC[:,:,0,:],min=0,max=viewportRes-1).long()
+        yCoord = torch.clamp(ViewPredictedPC[:,:,1,:],min=0,max=viewportRes-1).long()
+        # TODO : Depth에 대한 clamp 방법 생각 필요함
 
-        xCoords = Index[:, :, 0, :].int() # (batch_size x num_view x num_points)
-        yCoords = Index[:, :, 1, :].int() # (batch_size x num_view x num_points)
+        Depth = ViewPredictedPC[:,:,2,:]
 
         DepthImg = torch.zeros([batch_size , self.args.num_view, viewportRes * viewportRes], dtype=torch.float32).to(
             torch.device('cuda'))
 
-        with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
-            for p in range(Index.shape[3]):
-                px = xCoords[:, :, p] # (batch_size x num_view) --> 모든 batch, 2개 view에서 해당 점의 x좌표
-                py = yCoords[:, :, p] # (batch_size x num_view) --> 모든 batch, 2개 view에서 해당 점의 y좌표
-                pDepth = Depth[:,:,p].clone() # (batch_size x num_view), depth는 1-depth 값을 사용(가까이 있는 점이 높은 pixel value), 이런 부분에서 clone하지 않으면 backward propagation에서 오류 발생
+        # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
+        for p in range(xCoord.shape[2]):
+            pDepth = Depth[:,:,p]
 
-                # px, py가 이미지 범위를 벗어난 경우 && depth가 0~1 범위 벗어난 경우 x,y 픽셀 값을 0으로 바꾸고, depth값도 background값(1)으로 바꿈
-                outBoundIndices = (px < 0) | (px >= viewportRes) | (py < 0) | (py >= viewportRes) | (pDepth < 0) | (pDepth > 1)
-                px[outBoundIndices] = 0
-                py[outBoundIndices] = 0
-                pDepth[outBoundIndices] = 0
+            # 계산 편의를 위해 indexed representation으로 변환
+            FlattenIndex = (xCoord[:,:,p] * viewportRes + yCoord[:,:,p]).unsqueeze(2) # (batch x num_view x viewportRes * viewportRes)
 
-                # 계산 편의를 위해 indexed representation으로 변환
-                FlattenIndex = (px * viewportRes + py).unsqueeze(2).long()
+            # gather를 통해 현재 depth buffer에 쓰여 있는 값을 얻어올 수 있음. 이를 pDepth와 element-wise 비교해 새로 쓰여질 값 텐서를 생성
+            maxVals = torch.max(DepthImg.gather(2, FlattenIndex).squeeze(),pDepth)
+            # scatter를 통해 maxVals의 값을 다시 FlattenDepthImg에 Write
+            DepthImg = DepthImg.scatter(2, FlattenIndex, maxVals.unsqueeze(2))
 
-                # gather를 통해 현재 depth buffer에 쓰여 있는 값을 얻어올 수 있음. 이를 pDepth와 element-wise 비교해 새로 쓰여질 값 텐서를 생성
-                maxVals = torch.max(DepthImg.gather(2, FlattenIndex).squeeze(),pDepth)
-                # scatter를 통해 maxVals의 값을 다시 FlattenDepthImg에 Write
-                DepthImg = DepthImg.scatter(2, FlattenIndex, maxVals.unsqueeze(2))
+        DepthImg = DepthImg.view((batch_size , self.args.num_view, viewportRes , viewportRes))
 
-            DepthImg = DepthImg.view((batch_size , self.args.num_view, viewportRes , viewportRes))
-
-        print(prof)
+        # print(prof)
 
         # Debug Draw
         # plt.imshow(DepthImg[1, 0, :, :].cpu().detach().numpy())
