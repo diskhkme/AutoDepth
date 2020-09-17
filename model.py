@@ -240,6 +240,7 @@ class DGCNN_AutoDepth(nn.Module):
         x = self.dp2(x)
         x = self.linear3(x)  # (batch_size, 256) -> (batch_size, output_channels)
 
+        # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
         # -----------View Prediction------------------------------------------------------------#
         xre = x.view(batch_size, self.args.num_view, 6)
         unitn = xre[:,:,0:3] / xre[:,:,0:3].norm(dim=2).view(batch_size,self.args.num_view,1)
@@ -253,12 +254,12 @@ class DGCNN_AutoDepth(nn.Module):
         # (16x2x3x3) * (16x3x1024) --> (16x2x3x1024)를 원하는데...
         # ViewPredictedPC = torch.matmul(matC,sourcePoints)
         # ViewPredictedPC = torch.stack((torch.bmm(matC[:, 0, :, :], sourcePoints),torch.bmm(matC[:, 1, :, :], sourcePoints)),dim=1)
-        
+
         # ViewPoints1 = torch.bmm(matC[:,0,:,:],sourcePoints - xre[:,0,0:3].unsqueeze(-1)) # 카메라가 항상 unit sphere 위에 있지는 않음
         # ViewPoints2 = torch.bmm(matC[:,1,:,:],sourcePoints - xre[:,1,0:3].unsqueeze(-1))
         ViewPoints1 = torch.bmm(matC[:, 0, :, :], sourcePoints - unitn[:, 0, :].unsqueeze(-1))  # 카메라가 항상 unit sphere 위에 있도록
         ViewPoints2 = torch.bmm(matC[:, 1, :, :], sourcePoints - unitn[:, 1, :].unsqueeze(-1))
-        
+
         ViewPredictedPC = torch.zeros([batch_size , self.args.num_view, sourcePoints.shape[1], sourcePoints.shape[2]], dtype=torch.float32).to(
             torch.device('cuda'))
         for i in range(batch_size): # 이전 코드에서 잘못된 부분 수정. 0 dim에서 한 모델에 대한 다른 뷰 이미지가 번갈아 나와야 하는데 이전 버전에서는 batch * first view와 batch * second view를 stack했음
@@ -268,13 +269,14 @@ class DGCNN_AutoDepth(nn.Module):
         # --------------------------------------------------------------------------------------#
         # print(prof)
 
-        # with profiler.profile(record_shapes=True, use_cuda=True) as prof:
+        # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
         #-------------Depth Image Generation----------------------------------------------------#
         # Orthograpghic Projection
         # Segmented Point cloud의 경우 unit sphere 안으로 normalize되었으니 모든 점이 [-1, 1]^3 안에 들어와 있음
         # x,y축으로는 viewportWidth(Height)/2 만큼 곱한 뒤 viewportWidth(Height) / 2 만큼 더하면 [0,viewportWidth] 범위로 변환됨
         # z축으로는 2로 나눈뒤 0.5만큼 더하면 [0,1] 범위로 변환됨
         # (ModelNet의 경우 normalize 안되었으니 다르게 구현해야 함)
+
         viewportRes = self.args.projected_img_res
 
         ViewPredictedPC[:, :, 0, :] = ViewPredictedPC[:, :, 0, :] * viewportRes/2 + viewportRes/2
@@ -290,26 +292,29 @@ class DGCNN_AutoDepth(nn.Module):
         DepthImg = torch.zeros([batch_size , self.args.num_view, viewportRes * viewportRes], dtype=torch.float32).to(
             torch.device('cuda'))
 
-        for p in range(Index.shape[3]):
-            px = xCoords[:, :, p] # (batch_size x num_view) --> 모든 batch, 2개 view에서 해당 점의 x좌표
-            py = yCoords[:, :, p] # (batch_size x num_view) --> 모든 batch, 2개 view에서 해당 점의 y좌표
-            pDepth = Depth[:,:,p].clone() # (batch_size x num_view), depth는 1-depth 값을 사용(가까이 있는 점이 높은 pixel value), 이런 부분에서 clone하지 않으면 backward propagation에서 오류 발생
+        with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
+            for p in range(Index.shape[3]):
+                px = xCoords[:, :, p] # (batch_size x num_view) --> 모든 batch, 2개 view에서 해당 점의 x좌표
+                py = yCoords[:, :, p] # (batch_size x num_view) --> 모든 batch, 2개 view에서 해당 점의 y좌표
+                pDepth = Depth[:,:,p].clone() # (batch_size x num_view), depth는 1-depth 값을 사용(가까이 있는 점이 높은 pixel value), 이런 부분에서 clone하지 않으면 backward propagation에서 오류 발생
 
-            # px, py가 이미지 범위를 벗어난 경우 && depth가 0~1 범위 벗어난 경우 x,y 픽셀 값을 0으로 바꾸고, depth값도 background값(1)으로 바꿈
-            outBoundIndices = (px < 0) | (px >= viewportRes) | (py < 0) | (py >= viewportRes) | (pDepth < 0) | (pDepth > 1)
-            px[outBoundIndices] = 0
-            py[outBoundIndices] = 0
-            pDepth[outBoundIndices] = 0
+                # px, py가 이미지 범위를 벗어난 경우 && depth가 0~1 범위 벗어난 경우 x,y 픽셀 값을 0으로 바꾸고, depth값도 background값(1)으로 바꿈
+                outBoundIndices = (px < 0) | (px >= viewportRes) | (py < 0) | (py >= viewportRes) | (pDepth < 0) | (pDepth > 1)
+                px[outBoundIndices] = 0
+                py[outBoundIndices] = 0
+                pDepth[outBoundIndices] = 0
 
-            # 계산 편의를 위해 indexed representation으로 변환
-            FlattenIndex = (px * viewportRes + py).unsqueeze(2).long()
+                # 계산 편의를 위해 indexed representation으로 변환
+                FlattenIndex = (px * viewportRes + py).unsqueeze(2).long()
 
-            # gather를 통해 현재 depth buffer에 쓰여 있는 값을 얻어올 수 있음. 이를 pDepth와 element-wise 비교해 새로 쓰여질 값 텐서를 생성
-            maxVals = torch.max(DepthImg.gather(2, FlattenIndex).squeeze(),pDepth)
-            # scatter를 통해 maxVals의 값을 다시 FlattenDepthImg에 Write
-            DepthImg = DepthImg.scatter(2, FlattenIndex, maxVals.unsqueeze(2))
+                # gather를 통해 현재 depth buffer에 쓰여 있는 값을 얻어올 수 있음. 이를 pDepth와 element-wise 비교해 새로 쓰여질 값 텐서를 생성
+                maxVals = torch.max(DepthImg.gather(2, FlattenIndex).squeeze(),pDepth)
+                # scatter를 통해 maxVals의 값을 다시 FlattenDepthImg에 Write
+                DepthImg = DepthImg.scatter(2, FlattenIndex, maxVals.unsqueeze(2))
 
-        DepthImg = DepthImg.view((batch_size , self.args.num_view, viewportRes , viewportRes))
+            DepthImg = DepthImg.view((batch_size , self.args.num_view, viewportRes , viewportRes))
+
+        print(prof)
 
         # Debug Draw
         # plt.imshow(DepthImg[1, 0, :, :].cpu().detach().numpy())

@@ -204,7 +204,7 @@ def load_data_knu_segmented(partition):
     DATA_DIR = 'D:\Test_Models\SegmentedPointCloud\PointNet\HDF5'
     if partition == 'train':
         for h5_name in glob.glob(os.path.join(DATA_DIR, 'train_*.h5')):
-            f = h5py.File(h5_name)
+            f = h5py.File(h5_name,'r')
             data = f['data'][:].astype('float32')
             label = f['label'][:].astype('int64')
             f.close()
@@ -212,7 +212,7 @@ def load_data_knu_segmented(partition):
             all_label.append(label)
     if partition == 'test':
         for h5_name in glob.glob(os.path.join(DATA_DIR, 'test_*.h5')):
-            f = h5py.File(h5_name)
+            f = h5py.File(h5_name,'r')
             data = f['data'][:].astype('float32')
             label = f['label'][:].astype('int64')
             f.close()
