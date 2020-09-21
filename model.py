@@ -25,6 +25,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import torchvision.models as models
 import torch.autograd.profiler as profiler
+import time
 
 def knn(x, k):
     inner = -2*torch.matmul(x.transpose(2, 1), x)
@@ -205,169 +206,192 @@ class DGCNN_AutoDepth(nn.Module):
         self.net_2 = nn.Linear(2048,args.output_channels)
 
     def forward(self, x):
-        batch_size = x.size(0)
-        sourcePoints = x.clone()
+        with torch.cuda.device(0):
+            batch_size = x.size(0)
+            sourcePoints = x.clone()
 
-        x = x[:,:,:self.args.num_subpoints_for_view_pred] # view prediction을 위해서는 원본 점군의 subset만 활용
-        x = get_graph_feature(x, k=self.k)  # (batch_size, 3, num_points) -> (batch_size, 3*2, num_points, k)
-        x = self.conv1(x)  # (batch_size, 3*2, num_points, k) -> (batch_size, 64, num_points, k)
-        x1 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
+            x = x[:,:,:self.args.num_subpoints_for_view_pred] # view prediction을 위해서는 원본 점군의 subset만 활용
+            x = get_graph_feature(x, k=self.k)  # (batch_size, 3, num_points) -> (batch_size, 3*2, num_points, k)
+            x = self.conv1(x)  # (batch_size, 3*2, num_points, k) -> (batch_size, 64, num_points, k)
+            x1 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
 
-        x = get_graph_feature(x1, k=self.k)  # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
-        x = self.conv2(x)  # (batch_size, 64*2, num_points, k) -> (batch_size, 64, num_points, k)
-        x2 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
+            x = get_graph_feature(x1, k=self.k)  # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
+            x = self.conv2(x)  # (batch_size, 64*2, num_points, k) -> (batch_size, 64, num_points, k)
+            x2 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
 
-        x = get_graph_feature(x2, k=self.k)  # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
-        x = self.conv3(x)  # (batch_size, 64*2, num_points, k) -> (batch_size, 128, num_points, k)
-        x3 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 128, num_points, k) -> (batch_size, 128, num_points)
+            x = get_graph_feature(x2, k=self.k)  # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
+            x = self.conv3(x)  # (batch_size, 64*2, num_points, k) -> (batch_size, 128, num_points, k)
+            x3 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 128, num_points, k) -> (batch_size, 128, num_points)
 
-        x = get_graph_feature(x3, k=self.k)  # (batch_size, 128, num_points) -> (batch_size, 128*2, num_points, k)
-        x = self.conv4(x)  # (batch_size, 128*2, num_points, k) -> (batch_size, 256, num_points, k)
-        x4 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 256, num_points, k) -> (batch_size, 256, num_points)
+            x = get_graph_feature(x3, k=self.k)  # (batch_size, 128, num_points) -> (batch_size, 128*2, num_points, k)
+            x = self.conv4(x)  # (batch_size, 128*2, num_points, k) -> (batch_size, 256, num_points, k)
+            x4 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 256, num_points, k) -> (batch_size, 256, num_points)
 
-        x = torch.cat((x1, x2, x3, x4), dim=1)  # (batch_size, 64+64+128+256, num_points)
+            x = torch.cat((x1, x2, x3, x4), dim=1)  # (batch_size, 64+64+128+256, num_points)
 
-        x = self.conv5(x)  # (batch_size, 64+64+128+256, num_points) -> (batch_size, emb_dims, num_points)
-        x1 = F.adaptive_max_pool1d(x, 1).view(batch_size,
-                                              -1)  # (batch_size, emb_dims, num_points) -> (batch_size, emb_dims)
-        x2 = F.adaptive_avg_pool1d(x, 1).view(batch_size,
-                                              -1)  # (batch_size, emb_dims, num_points) -> (batch_size, emb_dims)
-        x = torch.cat((x1, x2), 1)  # (batch_size, emb_dims*2)
+            x = self.conv5(x)  # (batch_size, 64+64+128+256, num_points) -> (batch_size, emb_dims, num_points)
+            x1 = F.adaptive_max_pool1d(x, 1).view(batch_size,
+                                                  -1)  # (batch_size, emb_dims, num_points) -> (batch_size, emb_dims)
+            x2 = F.adaptive_avg_pool1d(x, 1).view(batch_size,
+                                                  -1)  # (batch_size, emb_dims, num_points) -> (batch_size, emb_dims)
+            x = torch.cat((x1, x2), 1)  # (batch_size, emb_dims*2)
 
-        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)  # (batch_size, emb_dims*2) -> (batch_size, 512)
-        x = self.dp1(x)
-        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)  # (batch_size, 512) -> (batch_size, 256)
-        x = self.dp2(x)
-        x = self.linear3(x)  # (batch_size, 256) -> (batch_size, output_channels)
+            x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)  # (batch_size, emb_dims*2) -> (batch_size, 512)
+            x = self.dp1(x)
+            x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)  # (batch_size, 512) -> (batch_size, 256)
+            x = self.dp2(x)
+            x = self.linear3(x)  # (batch_size, 256) -> (batch_size, output_channels)
 
-        # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
-        # -----------View Prediction------------------------------------------------------------#
-        xre = x.view(batch_size, self.args.num_view, 6)
-        unitn = xre[:,:,0:3] / xre[:,:,0:3].norm(dim=2).view(batch_size,self.args.num_view,1)
-        up =xre[:,:,3:6] / xre[:,:,3:6].norm(dim=2).view(batch_size,self.args.num_view,1)
-        u = torch.cross(up,unitn)
-        unitu = u / u.norm(dim=2).view(batch_size,self.args.num_view,1)
-        unitv = torch.cross(unitn,unitu) #논문에서는 세 축의 orthogonalize과정은 없음. 이것을 추가하면 더 좋아질까? (원본 논문대로면 그냥 up벡터 사용)
+            # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
+            # -----------View Prediction------------------------------------------------------------#
+            xre = x.view(batch_size, self.args.num_view, 6)
+            unitn = xre[:,:,0:3] / xre[:,:,0:3].norm(dim=2).view(batch_size,self.args.num_view,1)
+            up =xre[:,:,3:6] / xre[:,:,3:6].norm(dim=2).view(batch_size,self.args.num_view,1)
+            u = torch.cross(up,unitn)
+            unitu = u / u.norm(dim=2).view(batch_size,self.args.num_view,1)
+            unitv = torch.cross(unitn,unitu) #논문에서는 세 축의 orthogonalize과정은 없음. 이것을 추가하면 더 좋아질까? (원본 논문대로면 그냥 up벡터 사용)
 
-        matC = torch.cat((unitu,unitv,unitn),dim=2).view(batch_size,self.args.num_view,3,3) # (batch_size x num_view x 3 x 3), camera matrix
-        # TODO : matmul broadcasting때문에 numview = 2로 고정을 가정하고 구현...
-        # (16x2x3x3) * (16x3x1024) --> (16x2x3x1024)를 원하는데...
-        # ViewPredictedPC = torch.matmul(matC,sourcePoints)
-        # ViewPredictedPC = torch.stack((torch.bmm(matC[:, 0, :, :], sourcePoints),torch.bmm(matC[:, 1, :, :], sourcePoints)),dim=1)
+            matC = torch.cat((unitu,unitv,unitn),dim=2).view(batch_size,self.args.num_view,3,3) # (batch_size x num_view x 3 x 3), camera matrix
+            # TODO : matmul broadcasting때문에 numview = 2로 고정을 가정하고 구현...
+            # (16x2x3x3) * (16x3x1024) --> (16x2x3x1024)를 원하는데...
+            # ViewPredictedPC = torch.matmul(matC,sourcePoints)
+            # ViewPredictedPC = torch.stack((torch.bmm(matC[:, 0, :, :], sourcePoints),torch.bmm(matC[:, 1, :, :], sourcePoints)),dim=1)
 
-        # ViewPoints1 = torch.bmm(matC[:,0,:,:],sourcePoints - xre[:,0,0:3].unsqueeze(-1)) # 카메라가 항상 unit sphere 위에 있지는 않음
-        # ViewPoints2 = torch.bmm(matC[:,1,:,:],sourcePoints - xre[:,1,0:3].unsqueeze(-1))
-        ViewPoints1 = torch.bmm(matC[:, 0, :, :], sourcePoints - unitn[:, 0, :].unsqueeze(-1))  # 카메라가 항상 unit sphere 위에 있도록
-        ViewPoints2 = torch.bmm(matC[:, 1, :, :], sourcePoints - unitn[:, 1, :].unsqueeze(-1))
+            # ViewPoints1 = torch.bmm(matC[:,0,:,:],sourcePoints - xre[:,0,0:3].unsqueeze(-1)) # 카메라가 항상 unit sphere 위에 있지는 않음
+            # ViewPoints2 = torch.bmm(matC[:,1,:,:],sourcePoints - xre[:,1,0:3].unsqueeze(-1))
+            ViewPoints1 = torch.bmm(matC[:, 0, :, :], sourcePoints - unitn[:, 0, :].unsqueeze(-1))  # 카메라가 항상 unit sphere 위에 있도록
+            ViewPoints2 = torch.bmm(matC[:, 1, :, :], sourcePoints - unitn[:, 1, :].unsqueeze(-1))
 
-        ViewPredictedPC = torch.zeros([batch_size , self.args.num_view, sourcePoints.shape[1], sourcePoints.shape[2]], dtype=torch.float32).to(
-            torch.device('cuda'))
-        for i in range(batch_size): # 이전 코드에서 잘못된 부분 수정. 0 dim에서 한 모델에 대한 다른 뷰 이미지가 번갈아 나와야 하는데 이전 버전에서는 batch * first view와 batch * second view를 stack했음
-            ViewPredictedPC[i, 0, :, :] = ViewPoints1[i,:,:]
-            ViewPredictedPC[i, 1, :, :] = ViewPoints2[i, :, :]
+            ViewPredictedPC = torch.zeros([batch_size , self.args.num_view, sourcePoints.shape[1], sourcePoints.shape[2]], dtype=torch.float32).to(
+                torch.device('cuda'))
+            for i in range(batch_size):
+                ViewPredictedPC[i, 0, :, :] = ViewPoints1[i,:,:]
+                ViewPredictedPC[i, 1, :, :] = ViewPoints2[i, :, :]
 
-        # --------------------------------------------------------------------------------------#
-        # print(prof)
+            # --------------------------------------------------------------------------------------#
+            # print(prof)
 
-        # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
-        #-------------Depth Image Generation----------------------------------------------------#
-        # Orthograpghic Projection
-        # Segmented Point cloud의 경우 unit sphere 안으로 normalize되었으니 모든 점이 [-1, 1]^3 안에 들어와 있음
-        # x,y축으로는 viewportWidth(Height)/2 만큼 곱한 뒤 viewportWidth(Height) / 2 만큼 더하면 [0,viewportWidth] 범위로 변환됨
-        # z축으로는 2로 나눈뒤 0.5만큼 더하면 [0,1] 범위로 변환됨
-        # (ModelNet의 경우 normalize 안되었으니 다르게 구현해야 함)
+            # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
+            #-------------Depth Image Generation----------------------------------------------------#
+            # Orthograpghic Projection
+            # Segmented Point cloud의 경우 unit sphere 안으로 normalize되었으니 모든 점이 [-1, 1]^3 안에 들어와 있음
+            # x,y축으로는 viewportWidth(Height)/2 만큼 곱한 뒤 viewportWidth(Height) / 2 만큼 더하면 [0,viewportWidth] 범위로 변환됨
+            # z축으로는 2로 나눈뒤 0.5만큼 더하면 [0,1] 범위로 변환됨
+            # (ModelNet의 경우 normalize 안되었으니 다르게 구현해야 함)
 
-        viewportRes = self.args.projected_img_res
+            viewportRes = self.args.projected_img_res
 
-        ViewPredictedPC[:, :, 0, :] = ViewPredictedPC[:, :, 0, :] * viewportRes/2 + viewportRes/2
-        ViewPredictedPC[:, :, 1, :] = ViewPredictedPC[:, :, 1, :] * viewportRes/2 + viewportRes/2
-        ViewPredictedPC[:, :, 2, :] = ViewPredictedPC[:, :, 2, :]/2 + 1 # [0~-2] -> [0~-1] -> [1~0]
+            ViewPredictedPC[:, :, 0, :] = ViewPredictedPC[:, :, 0, :] * viewportRes/2 + viewportRes/2
+            ViewPredictedPC[:, :, 1, :] = ViewPredictedPC[:, :, 1, :] * viewportRes/2 + viewportRes/2
+            ViewPredictedPC[:, :, 2, :] = ViewPredictedPC[:, :, 2, :]/2 + 1 # [0~-2] -> [0~-1] -> [1~0]
 
-        #------------Filtering-------------------------------------------------------------------#
-        xCoord = ViewPredictedPC[:, :, 0, :] # (batch x view x num_point)
-        yCoord = ViewPredictedPC[:, :, 1, :] # (batch x view x num_point)
-        Depth = ViewPredictedPC[:, :, 2, :] # (batch x view x num_point)
+            #------------Filtering-------------------------------------------------------------------#
+            xCoord = ViewPredictedPC[:, :, 0, :] # (batch x view x num_point)
+            yCoord = ViewPredictedPC[:, :, 1, :] # (batch x view x num_point)
+            Depth = ViewPredictedPC[:, :, 2, :] # (batch x view x num_point)
 
-        param_sigma = 2.0
-        param_delta1 = 1.4*param_sigma
-        #param_delta2 = int(viewportRes / 12)
-        param_delta2 = 0.01 # NOTE : 원래 논문에서는 위의 값을 사용했으나, KNU dataset의 경우 depth가 0~1로 normalize 되었으므로 다른 값을 사용
-        sigma = 2
+            param_sigma = 2.0
+            param_delta1 = 1.4*param_sigma
+            #param_delta2 = int(viewportRes / 12)
+            param_delta2 = 0.01 # NOTE : 원래 논문에서는 위의 값을 사용했으나, KNU dataset의 경우 depth가 0~1로 normalize 되었으므로 다른 값을 사용
+            sigma = 2
 
-        maxdc = torch.zeros([batch_size , self.args.num_view, viewportRes , viewportRes], dtype=torch.float32).to(
-            torch.device('cuda'))
-        for i in range(viewportRes):
-            # print(i)
-            for j in range(viewportRes):
-                # (c_x, c_y) => (i,j)
-                # TODO : i,j를 차원을 늘려서 한번에 처리하여 위 두 loop를 없앨 수 있을 듯?
-                in_indices = torch.pow(xCoord - i,2) + torch.pow(yCoord-j,2) < param_delta1*param_delta1 # P'(c) points
-                true_indices = torch.where(in_indices)
-                if len(true_indices[2]) != 0: # 어떤 batch의 어떤 image인지 모르지만, 점이 delta1안에 들어왔을 경우
-                    last_b = true_indices[0][0]
-                    last_v = true_indices[1][0]
-                    pointDepth = 0
-                    for b, v, p in zip(true_indices[0], true_indices[1], true_indices[2]): # 점들 loop
-                        if b == last_b and v == last_v: # 이전과 같은 이미지의 데이터면
-                            curDepth = Depth[b,v,p]
-                            if curDepth > pointDepth: # 더 큰 값으로 갱신
-                                pointDepth = curDepth
+            start_time = time.time()
 
-                        if b != last_b or v != last_v: # 이전과 다른 이미지면
-                            maxdc[last_b,last_v,i,j] = pointDepth # 그전까지의 최종값으로 maxdc에 값 할당
-                            pointDepth = Depth[b,v,p]
-                            last_b = b
-                            last_v = v
+            #-----------------------------수정 전. 메모리 점유율 낮으나 느림------------------------------------------#
+            maxdc = torch.zeros([batch_size, self.args.num_view, viewportRes, viewportRes], dtype=torch.float32).to(
+                torch.device('cuda'))
+            for i in range(viewportRes):
+                # print(i)
+                for j in range(viewportRes):
+                    # (c_x, c_y) => (i,j)
+                    in_indices = torch.pow(xCoord - i, 2) + torch.pow(yCoord - j,2) < param_delta1 * param_delta1  # P'(c) points
+                    true_indices = torch.where(in_indices)
+                    if len(true_indices[2]) != 0:
+                        last_b = true_indices[0][0]
+                        last_v = true_indices[1][0]
+                        pointDepth = 0
+                        for b, v, p in zip(true_indices[0], true_indices[1], true_indices[2]):  # ???loop
+                            if b == last_b and v == last_v:  # ?댁怨?媛? ?대몄?? ?곗댄곕㈃
+                                curDepth = Depth[b, v, p]
+                                if curDepth > pointDepth:  # ? ??媛?쇰? 媛깆
+                                    pointDepth = curDepth
 
-                    maxdc[last_b,last_v,i,j] = pointDepth # 마지막에 같은 이미지 데이터가 몰려있을 경우가 있으므로 최종 값 갱신
+                            if b != last_b or v != last_v:
+                                maxdc[last_b,last_v,i,j] = pointDepth
+                                pointDepth = Depth[b,v,p]
+                                last_b = b
+                                last_v = v
 
-        # Debug Draw
-        # plt.imshow(maxdc[1, 0, :, :].cpu().detach().numpy())
+                        maxdc[last_b, last_v, i, j] = pointDepth
 
-        DepthImg = torch.zeros([batch_size , self.args.num_view, viewportRes, viewportRes], dtype=torch.float32).to(
-            torch.device('cuda'))
-        for i in range(viewportRes):
-            # print(i)
-            for j in range(viewportRes):
-                in_indices = torch.abs(maxdc[:,:,i,j].unsqueeze(-1) - Depth) < param_delta2
-                true_indices = torch.where(in_indices)
-                if len(true_indices[2]) != 0:  # 어떤 batch의 어떤 image인지 모르지만, 점이 delta2안에 들어왔을 경우
-                    last_b = true_indices[0][0]
-                    last_v = true_indices[1][0]
-                    numer = 0
-                    denom = 0
-                    for b, v, p in zip(true_indices[0], true_indices[1], true_indices[2]):  # 점들 loop
-                        gaussianInterp = torch.exp((-torch.pow(i-xCoord[b,v,p],2)-torch.pow(j-yCoord[b,v,p],2))/(2*sigma*sigma))
-                        if b == last_b and v == last_v:  # 이전과 같은 이미지의 데이터면
-                            numer = numer + gaussianInterp * Depth[b,v,p]
-                            denom = denom + gaussianInterp
+            #-----------------------------수정 버전, out of memory, 속도도 크게 빠르지 않은...----------------------------------------#
+            # maxdc = torch.zeros([batch_size , self.args.num_view, viewportRes , viewportRes], dtype=torch.float32).to(
+            #     torch.device('cuda'))
+            #
+            # sub_matrix = torch.range(0,viewportRes-1).repeat(xCoord.shape[0], xCoord.shape[1], xCoord.shape[2],1).to(torch.device('cuda'))
+            # sub_result_x = xCoord.unsqueeze(-1).expand(-1, -1, -1, viewportRes) - sub_matrix # (b x v x p x res). 4번째 축에 각각 xcoord-0, xcoord-1, xcoord-2.... 들어있음
+            # sub_result_y = yCoord.unsqueeze(-1).expand(-1, -1, -1, viewportRes) - sub_matrix
+            # sub_result_x = sub_result_x.unsqueeze(-1).expand(-1,-1,-1,-1,viewportRes)
+            # sub_result_y = sub_result_y.unsqueeze(-1).expand(-1, -1, -1, -1, viewportRes).transpose(3,4)
+            # in_indices = torch.pow(sub_result_x,2) + torch.pow(sub_result_y,2) < param_delta1*param_delta1
+            # true_indices = torch.where(in_indices) # TODO : out of memory...
+            #
+            # for b, v, p,x,y in zip(true_indices[0], true_indices[1], true_indices[2], true_indices[3], true_indices[4]): # 점들 loop
+            #     if maxdc[b,v,x,y] < Depth[b,v,p]:
+            #         maxdc[b, v, x, y] = Depth[b,v,p]
 
-                        if b != last_b or v != last_v:  # 이전과 다른 이미지면
-                            if denom != 0:
-                                DepthImg[last_b, last_v, i, j] = numer/denom  # 그전까지의 최종값으로 maxdc에 값 할당
-                            numer = 0
-                            denom = 0
-                            last_b = b
-                            last_v = v
+            print("--- %s seconds ---" % (time.time() - start_time))
 
-                    if denom != 0:
-                        DepthImg[last_b, last_v, i, j] = numer/denom  # 마지막에 같은 이미지 데이터가 몰려있을 경우가 있으므로 최종 값 갱신
+            # Debug Draw
+            # plt.imshow(maxdc[1, 0, :, :].cpu().detach().numpy())
 
-        # Debug Draw
-        # plt.imshow(DepthImg[1, 0, :, :].cpu().detach().numpy())
+            # TODO : gaussian 필터링 효과가 크게 없는 듯 하여 일단 max 이미지로 돌려봄
+            # DepthImg = torch.zeros([batch_size , self.args.num_view, viewportRes, viewportRes], dtype=torch.float32).to(
+            #     torch.device('cuda'))
+            # for i in range(viewportRes):
+            #     # print(i)
+            #     for j in range(viewportRes):
+            #         in_indices = torch.abs(maxdc[:,:,i,j].unsqueeze(-1) - Depth) < param_delta2
+            #         true_indices = torch.where(in_indices)
+            #         if len(true_indices[2]) != 0:  # 어떤 batch의 어떤 image인지 모르지만, 점이 delta2안에 들어왔을 경우
+            #             last_b = true_indices[0][0]
+            #             last_v = true_indices[1][0]
+            #             numer = 0
+            #             denom = 0
+            #             for b, v, p in zip(true_indices[0], true_indices[1], true_indices[2]):  # 점들 loop
+            #                 gaussianInterp = torch.exp((-torch.pow(i-xCoord[b,v,p],2)-torch.pow(j-yCoord[b,v,p],2))/(2*sigma*sigma))
+            #                 if b == last_b and v == last_v:  # 이전과 같은 이미지의 데이터면
+            #                     numer = numer + gaussianInterp * Depth[b,v,p]
+            #                     denom = denom + gaussianInterp
+            #
+            #                 if b != last_b or v != last_v:  # 이전과 다른 이미지면
+            #                     if denom != 0:
+            #                         DepthImg[last_b, last_v, i, j] = numer/denom  # 그전까지의 최종값으로 maxdc에 값 할당
+            #                     numer = 0
+            #                     denom = 0
+            #                     last_b = b
+            #                     last_v = v
+            #
+            #             if denom != 0:
+            #                 DepthImg[last_b, last_v, i, j] = numer/denom  # 마지막에 같은 이미지 데이터가 몰려있을 경우가 있으므로 최종 값 갱신
 
-        # Result Image dimension 변경 (batch * num_view x 3 x viewportRes x viewportRes) (mvcnn 구조에 입력하기 위함)
-        ResultImg = torch.stack((DepthImg, DepthImg, DepthImg), dim=2)
-        ResultImg = ResultImg.view(-1, ResultImg.shape[2], ResultImg.shape[3], ResultImg.shape[4])
+            # Debug Draw
+            # plt.imshow(DepthImg[1, 0, :, :].cpu().detach().numpy())
 
-        # print(prof)
+            # Result Image dimension 변경 (batch * num_view x 3 x viewportRes x viewportRes) (mvcnn 구조에 입력하기 위함)
+            # ResultImg = torch.stack((DepthImg, DepthImg, DepthImg), dim=2)
+            ResultImg = torch.stack((maxdc, maxdc, maxdc), dim=2)
+            ResultImg = ResultImg.view(-1, ResultImg.shape[2], ResultImg.shape[3], ResultImg.shape[4])
 
-        # Debug purpose, show image
-        # plt.imshow(ResultImg[0,:,:].cpu().detach().numpy().transpose(2,1,0))
+            # print(prof)
 
-        y = self.net_1(ResultImg)
-        y = y.view((int(ResultImg.shape[0] / self.args.num_view), self.args.num_view, y.shape[-3], y.shape[-2], y.shape[-1]))
-        y = self.net_2(torch.max(y,1)[0].view(y.shape[0],-1))
+            # Debug purpose, show image
+            # plt.imshow(ResultImg[0,:,:].cpu().detach().numpy().transpose(2,1,0))
+
+            y = self.net_1(ResultImg)
+            y = y.view((int(ResultImg.shape[0] / self.args.num_view), self.args.num_view, y.shape[-3], y.shape[-2], y.shape[-1]))
+            y = self.net_2(torch.max(y,1)[0].view(y.shape[0],-1))
 
         return y
 
