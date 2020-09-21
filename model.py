@@ -283,30 +283,75 @@ class DGCNN_AutoDepth(nn.Module):
         ViewPredictedPC[:, :, 1, :] = ViewPredictedPC[:, :, 1, :] * viewportRes/2 + viewportRes/2
         ViewPredictedPC[:, :, 2, :] = ViewPredictedPC[:, :, 2, :]/2 + 1 # [0~-2] -> [0~-1] -> [1~0]
 
-        xCoord = torch.clamp(ViewPredictedPC[:,:,0,:],min=0,max=viewportRes-1).long()
-        yCoord = torch.clamp(ViewPredictedPC[:,:,1,:],min=0,max=viewportRes-1).long()
-        # TODO : Depth에 대한 clamp 방법 생각 필요함
+        #------------Filtering-------------------------------------------------------------------#
+        xCoord = ViewPredictedPC[:, :, 0, :] # (batch x view x num_point)
+        yCoord = ViewPredictedPC[:, :, 1, :] # (batch x view x num_point)
+        Depth = ViewPredictedPC[:, :, 2, :] # (batch x view x num_point)
 
-        Depth = ViewPredictedPC[:,:,2,:]
+        param_sigma = 2.0
+        param_delta1 = 1.4*param_sigma
+        #param_delta2 = int(viewportRes / 12)
+        param_delta2 = 0.01 # NOTE : 원래 논문에서는 위의 값을 사용했으나, KNU dataset의 경우 depth가 0~1로 normalize 되었으므로 다른 값을 사용
+        sigma = 2
 
-        DepthImg = torch.zeros([batch_size , self.args.num_view, viewportRes * viewportRes], dtype=torch.float32).to(
+        maxdc = torch.zeros([batch_size , self.args.num_view, viewportRes , viewportRes], dtype=torch.float32).to(
             torch.device('cuda'))
+        for i in range(viewportRes):
+            # print(i)
+            for j in range(viewportRes):
+                # (c_x, c_y) => (i,j)
+                # TODO : i,j를 차원을 늘려서 한번에 처리하여 위 두 loop를 없앨 수 있을 듯?
+                in_indices = torch.pow(xCoord - i,2) + torch.pow(yCoord-j,2) < param_delta1*param_delta1 # P'(c) points
+                true_indices = torch.where(in_indices)
+                if len(true_indices[2]) != 0: # 어떤 batch의 어떤 image인지 모르지만, 점이 delta1안에 들어왔을 경우
+                    last_b = true_indices[0][0]
+                    last_v = true_indices[1][0]
+                    pointDepth = 0
+                    for b, v, p in zip(true_indices[0], true_indices[1], true_indices[2]): # 점들 loop
+                        if b == last_b and v == last_v: # 이전과 같은 이미지의 데이터면
+                            curDepth = Depth[b,v,p]
+                            if curDepth > pointDepth: # 더 큰 값으로 갱신
+                                pointDepth = curDepth
 
-        # with profiler.profile(record_shapes=True, use_cuda=True, profile_memory=True) as prof:
-        for p in range(xCoord.shape[2]):
-            pDepth = Depth[:,:,p]
+                        if b != last_b or v != last_v: # 이전과 다른 이미지면
+                            maxdc[last_b,last_v,i,j] = pointDepth # 그전까지의 최종값으로 maxdc에 값 할당
+                            pointDepth = Depth[b,v,p]
+                            last_b = b
+                            last_v = v
 
-            # 계산 편의를 위해 indexed representation으로 변환
-            FlattenIndex = (xCoord[:,:,p] * viewportRes + yCoord[:,:,p]).unsqueeze(2) # (batch x num_view x viewportRes * viewportRes)
+                    maxdc[last_b,last_v,i,j] = pointDepth # 마지막에 같은 이미지 데이터가 몰려있을 경우가 있으므로 최종 값 갱신
 
-            # gather를 통해 현재 depth buffer에 쓰여 있는 값을 얻어올 수 있음. 이를 pDepth와 element-wise 비교해 새로 쓰여질 값 텐서를 생성
-            maxVals = torch.max(DepthImg.gather(2, FlattenIndex).squeeze(),pDepth)
-            # scatter를 통해 maxVals의 값을 다시 FlattenDepthImg에 Write
-            DepthImg = DepthImg.scatter(2, FlattenIndex, maxVals.unsqueeze(2))
+        # Debug Draw
+        # plt.imshow(maxdc[1, 0, :, :].cpu().detach().numpy())
 
-        DepthImg = DepthImg.view((batch_size , self.args.num_view, viewportRes , viewportRes))
+        DepthImg = torch.zeros([batch_size , self.args.num_view, viewportRes, viewportRes], dtype=torch.float32).to(
+            torch.device('cuda'))
+        for i in range(viewportRes):
+            # print(i)
+            for j in range(viewportRes):
+                in_indices = torch.abs(maxdc[:,:,i,j].unsqueeze(-1) - Depth) < param_delta2
+                true_indices = torch.where(in_indices)
+                if len(true_indices[2]) != 0:  # 어떤 batch의 어떤 image인지 모르지만, 점이 delta2안에 들어왔을 경우
+                    last_b = true_indices[0][0]
+                    last_v = true_indices[1][0]
+                    numer = 0
+                    denom = 0
+                    for b, v, p in zip(true_indices[0], true_indices[1], true_indices[2]):  # 점들 loop
+                        gaussianInterp = torch.exp((-torch.pow(i-xCoord[b,v,p],2)-torch.pow(j-yCoord[b,v,p],2))/(2*sigma*sigma))
+                        if b == last_b and v == last_v:  # 이전과 같은 이미지의 데이터면
+                            numer = numer + gaussianInterp * Depth[b,v,p]
+                            denom = denom + gaussianInterp
 
-        # print(prof)
+                        if b != last_b or v != last_v:  # 이전과 다른 이미지면
+                            if denom != 0:
+                                DepthImg[last_b, last_v, i, j] = numer/denom  # 그전까지의 최종값으로 maxdc에 값 할당
+                            numer = 0
+                            denom = 0
+                            last_b = b
+                            last_v = v
+
+                    if denom != 0:
+                        DepthImg[last_b, last_v, i, j] = numer/denom  # 마지막에 같은 이미지 데이터가 몰려있을 경우가 있으므로 최종 값 갱신
 
         # Debug Draw
         # plt.imshow(DepthImg[1, 0, :, :].cpu().detach().numpy())
