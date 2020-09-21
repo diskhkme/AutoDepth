@@ -291,62 +291,52 @@ class DGCNN_AutoDepth(nn.Module):
             Depth = ViewPredictedPC[:, :, 2, :] # (batch x view x num_point)
 
             param_sigma = 2.0
-            param_delta1 = 1.4*param_sigma
+            param_delta1 = int(np.sqrt(1.4*param_sigma))
             #param_delta2 = int(viewportRes / 12)
             param_delta2 = 0.01 # NOTE : 원래 논문에서는 위의 값을 사용했으나, KNU dataset의 경우 depth가 0~1로 normalize 되었으므로 다른 값을 사용
             sigma = 2
 
             start_time = time.time()
 
-            #-----------------------------수정 전. 메모리 점유율 낮으나 느림------------------------------------------#
-            maxdc = torch.zeros([batch_size, self.args.num_view, viewportRes, viewportRes], dtype=torch.float32).to(
+            # -----------------------------2차 개선------------------------------------------#
+            maxdc = torch.zeros([batch_size, self.args.num_view, viewportRes*viewportRes], dtype=torch.float32).to(
                 torch.device('cuda'))
-            for i in range(viewportRes):
-                # print(i)
-                for j in range(viewportRes):
-                    # (c_x, c_y) => (i,j)
-                    in_indices = torch.pow(xCoord - i, 2) + torch.pow(yCoord - j,2) < param_delta1 * param_delta1  # P'(c) points
-                    true_indices = torch.where(in_indices)
-                    if len(true_indices[2]) != 0:
-                        last_b = true_indices[0][0]
-                        last_v = true_indices[1][0]
-                        pointDepth = 0
-                        for b, v, p in zip(true_indices[0], true_indices[1], true_indices[2]):  # ???loop
-                            if b == last_b and v == last_v:  # ?댁怨?媛? ?대몄?? ?곗댄곕㈃
-                                curDepth = Depth[b, v, p]
-                                if curDepth > pointDepth:  # ? ??媛?쇰? 媛깆
-                                    pointDepth = curDepth
+            delta1_range = np.arange(-param_delta1,param_delta1+1).astype(int)
+            for p in range(xCoord.shape[2]):
+                pDepth = Depth[:,:,p].unsqueeze(-1)
 
-                            if b != last_b or v != last_v:
-                                maxdc[last_b,last_v,i,j] = pointDepth
-                                pointDepth = Depth[b,v,p]
-                                last_b = b
-                                last_v = v
+                # FlattenIndex = (xCoord[:,:,p] * viewportRes + yCoord[:,:,p]).unsqueeze(2)
+                xIndices = xCoord[:,:,p].unsqueeze(-1).long()
+                yIndices = yCoord[:,:,p].unsqueeze(-1).long()
 
-                        maxdc[last_b, last_v, i, j] = pointDepth
 
-            #-----------------------------수정 버전, out of memory, 속도도 크게 빠르지 않은...----------------------------------------#
-            # maxdc = torch.zeros([batch_size , self.args.num_view, viewportRes , viewportRes], dtype=torch.float32).to(
-            #     torch.device('cuda'))
-            #
-            # sub_matrix = torch.range(0,viewportRes-1).repeat(xCoord.shape[0], xCoord.shape[1], xCoord.shape[2],1).to(torch.device('cuda'))
-            # sub_result_x = xCoord.unsqueeze(-1).expand(-1, -1, -1, viewportRes) - sub_matrix # (b x v x p x res). 4번째 축에 각각 xcoord-0, xcoord-1, xcoord-2.... 들어있음
-            # sub_result_y = yCoord.unsqueeze(-1).expand(-1, -1, -1, viewportRes) - sub_matrix
-            # sub_result_x = sub_result_x.unsqueeze(-1).expand(-1,-1,-1,-1,viewportRes)
-            # sub_result_y = sub_result_y.unsqueeze(-1).expand(-1, -1, -1, -1, viewportRes).transpose(3,4)
-            # in_indices = torch.pow(sub_result_x,2) + torch.pow(sub_result_y,2) < param_delta1*param_delta1
-            # true_indices = torch.where(in_indices) # TODO : out of memory...
-            #
-            # for b, v, p,x,y in zip(true_indices[0], true_indices[1], true_indices[2], true_indices[3], true_indices[4]): # 점들 loop
-            #     if maxdc[b,v,x,y] < Depth[b,v,p]:
-            #         maxdc[b, v, x, y] = Depth[b,v,p]
+                for i in delta1_range:
+                    for j in delta1_range:
+                        xIndices = torch.cat((xIndices, (xCoord[:, :, p] + i).unsqueeze(-1).long()),dim=2)
+                        yIndices = torch.cat((yIndices, (yCoord[:, :, p] + j).unsqueeze(-1).long()), dim=2)
+                        pDepth = torch.cat((pDepth,Depth[:,:,p].unsqueeze(-1)),dim=2)
+
+                outBoundIndices = (xIndices < 0) | (xIndices >= viewportRes) | (
+                            yIndices < 0) | (yIndices >= viewportRes) | (pDepth < 0) | (
+                                              pDepth > 1)
+                xIndices[outBoundIndices] = 0
+                yIndices[outBoundIndices] = 0
+                pDepth[outBoundIndices] = 0
+
+                FlattenIndex = (xIndices * viewportRes + yIndices)
+
+                with torch.autograd.no_grad(): # TODO : no_grad 문제 없는건지...?
+                    maxVals = torch.max(maxdc.gather(2, FlattenIndex), pDepth)
+                    maxdc = maxdc.scatter_(2, FlattenIndex, maxVals)
+
+            maxdc = maxdc.view((batch_size , self.args.num_view, viewportRes , viewportRes))
 
             print("--- %s seconds ---" % (time.time() - start_time))
 
             # Debug Draw
             # plt.imshow(maxdc[1, 0, :, :].cpu().detach().numpy())
 
-            # TODO : gaussian 필터링 효과가 크게 없는 듯 하여 일단 max 이미지로 돌려봄
+            # TODO : gaussian 필터링 위의 2차 개선안처럼 수정 필요. 또한 loop를 별도로 두지 않고 통합 가능하지 고민해 보기
             # DepthImg = torch.zeros([batch_size , self.args.num_view, viewportRes, viewportRes], dtype=torch.float32).to(
             #     torch.device('cuda'))
             # for i in range(viewportRes):
